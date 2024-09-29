@@ -1,0 +1,137 @@
+
+name: Python CI/CD
+
+on:
+  push:
+    branches:
+      - main  # Triggers the action on every push to the "main" branch
+  pull_request:
+    branches:
+      - main  # Also runs when a pull request is made to the "main" branch
+
+jobs:
+  build-test-deploy:
+
+    runs-on: ubuntu-latest  # Use the latest version of Ubuntu
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3  # This checks out the code from your repository
+
+    - name: Set up Python
+      uses: actions/setup-python@v4  # Set up the Python version
+      with:
+        python-version: '3.10'  
+
+    - name: Cache pip
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt  # Install dependencies from the requirements.txt
+
+    - name: Verify pytest-cov installation
+      run: |
+        pip show pytest-cov  # Verify that pytest-cov is installed
+
+    - name: Set PYTHONPATH
+      run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
+    - name: Set Environment Variables
+      run: |
+        echo "DATA_FILE=weather_forecast_csv/processed_weatherHistory.csv" >> $GITHUB_ENV
+
+    - name: Run tests with coverage
+      run: |
+        pytest -v --cov=src tests/  # Run tests with coverage reporting
+
+    - name: Run data preprocessing and model selection
+      run: |
+        python src/data_preprocessing.py  # Preprocessing step
+        python src/model_selection.py  # Model selection and training
+
+    - name: Replace placeholders in best_model_pipeline.py
+      run: |
+        sed -i 's|PATH/TO/DATA/FILE|weather_forecast_csv/processed_weatherHistory.csv|g' best_model_pipeline.py
+        sed -i 's|COLUMN_SEPARATOR|,|g' best_model_pipeline.py
+        sed -i "s/'target'/'Temperature (C)'/g" best_model_pipeline.py
+
+    - name: Verify placeholder replacement
+      run: |
+        grep 'weather_forecast_csv/processed_weatherHistory.csv' best_model_pipeline.py
+        grep "sep=','" best_model_pipeline.py
+
+    - name: Print best_model_pipeline.py contents
+      run: |
+        cat best_model_pipeline.py
+
+    - name: Run LIME Explainability
+      run: |
+        python src/lime_explainability.py  # LIME explainability step
+
+    - name: Run SHAP Explainability
+      run: |
+        python src/shap_explainability.py  # SHAP explainability step
+
+    - name: Upload LIME Explanation as Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: lime-explanation
+        path: lime_explanation.html
+
+    - name: Upload SHAP Summary Plot as Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: shap-summary-plot
+        path: shap_summary_plot.png
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Log in to Amazon ECR
+      id: ecr-login
+      uses: aws-actions/amazon-ecr-login@v1
+      with:
+        region: ${{ secrets.AWS_REGION }}
+
+    - name: Build and push Docker image
+      run: |
+        IMAGE_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"
+        docker build -t $IMAGE_URI .
+        docker push $IMAGE_URI
+
+    - name: Check if Lambda function exists
+      id: lambda-check
+      run: |
+        if aws lambda get-function --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }}; then
+          echo "exists=true" >> $GITHUB_ENV
+        else
+          echo "exists=false" >> $GITHUB_ENV
+        fi
+
+    - name: Create or update Lambda function
+      run: |
+        if [ "${{ env.exists }}" = "true" ]; then
+          aws lambda update-function-code --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --image-uri "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"
+        else
+          aws lambda create-function --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --package-type Image \
+            --code ImageUri="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}" \
+            --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/LambdaExecutionRole \
+            --timeout 70 \
+            --memory-size 512
+        fi
